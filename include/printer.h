@@ -8,7 +8,54 @@
 #include <string.h>
 #include <stdarg.h>
 #include <unistd.h>
+
+#ifdef _WIN32
+
 #include <conio.h>
+
+typedef int TerminalState;
+static inline int portable_getch(void) { return getch(); }
+static inline int portable_ungetch(int ch) { return ungetch(ch); }
+static inline int portable_kbhit(void) { return kbhit(); }
+static inline TerminalState enable_raw(void) { return 0; }
+static inline void disable_raw(TerminalState ts) { (void)ts; }
+
+#else
+
+#include <termios.h>
+#include <sys/select.h>
+
+typedef struct termios TerminalState;
+
+static inline TerminalState enable_raw(void) {
+    struct termios old, raw;
+    tcgetattr(STDIN_FILENO, &old);
+    raw = old;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    return old;
+}
+
+static inline void disable_raw(TerminalState term) { tcsetattr(STDIN_FILENO, TCSANOW, &term); }
+
+static inline int portable_getch(void) {
+    TerminalState old = enable_raw();
+    int ch = getchar();
+    disable_raw(old);
+    return ch;
+}
+
+static inline int portable_ungetch(int ch) { return ungetc(ch, stdin); }
+
+static inline int portable_kbhit(void) {
+    struct timeval tv = {0, 0};
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    return select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0;
+}
+
+#endif
 
 /* Printer definition */
 typedef struct _printer {
@@ -33,7 +80,7 @@ typedef struct _printer {
 #define gray (1 << 2)
 #define bold (1 << 3)
 
-void _apply_style(FILE *to, Printer p) {
+static inline void _apply_style(FILE *to, Printer p) {
     if (p.style & bold) fprintf(to, "\033[1m");
 
     if (p.style & red) fprintf(to, "\033[31m");
@@ -42,7 +89,7 @@ void _apply_style(FILE *to, Printer p) {
 }
 
 /* add delay */
-void _add_pad(FILE *to, int8_t *side, int32_t space, int32_t *remaining) {
+static inline void _add_pad(FILE *to, int8_t *side, int32_t space, int32_t *remaining) {
     if (!side) return;
 
     int32_t pad_size = strlen((char *)side);
@@ -59,12 +106,12 @@ void _add_pad(FILE *to, int8_t *side, int32_t space, int32_t *remaining) {
     }
 }
 
-void _interpret_input(Printer p, bool *should_ff) {
+static inline void _interpret_input(Printer p, bool *should_ff) {
     if (!p.speedup) return;
 
     bool match = false;
-    if (kbhit()) {
-        int key_pressed = getch();
+    if (portable_kbhit()) {
+        int key_pressed = portable_getch();
         size_t speed_len = strlen(p.speedup);
         for (size_t idx = 0; idx < speed_len; idx++) {
             if (key_pressed == p.speedup[idx]) {
@@ -74,11 +121,11 @@ void _interpret_input(Printer p, bool *should_ff) {
         }
 
         if (match) (*should_ff) = !(*should_ff);
-        else ungetch(key_pressed);
+        else portable_ungetch(key_pressed);
     }
 }
 
-void _add_char(FILE *to, Printer p, int32_t ms) {
+static inline void _add_char(FILE *to, Printer p, int32_t ms) {
     size_t text_size = strlen(p.text);
     int32_t available_space = p.width - text_size;
     int32_t extra = 0;
@@ -111,7 +158,7 @@ void _add_char(FILE *to, Printer p, int32_t ms) {
 #define hide false
 #define show true
 
-Printer _makePrinter(struct _printer defaults) {
+static inline Printer _makePrinter(struct _printer defaults) {
     Printer p = defaults;
 
     p.text = (p.text) ? p.text : (int8_t *)("");
@@ -128,7 +175,7 @@ Printer _makePrinter(struct _printer defaults) {
     return p;
 }
 
-int8_t *_fmt(int8_t *buff, size_t buff_size, int8_t *fmt, ...) {
+static inline int8_t *_fmt(int8_t *buff, size_t buff_size, int8_t *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     vsnprintf(buff, buff_size, fmt, args);
@@ -146,7 +193,7 @@ int8_t *_fmt(int8_t *buff, size_t buff_size, int8_t *fmt, ...) {
 #define CURSOR_S "\033[?25h"
 #define CURSOR_H "\033[?25l"
 
-void _use_printer(Printer p) {
+static inline void _use_printer(Printer p) {
     FILE *to = stdout;
 
     if (strcmp(p.out, "stdout")) to = fopen(p.out, "a");
@@ -180,7 +227,9 @@ void _use_printer(Printer p) {
  */
 #define print(...) do { \
     Printer _p = _makePrinter((Printer){__VA_ARGS__}); \
+    TerminalState _ts = enable_raw(); \
     _use_printer(_p); \
+    disable_raw(_ts); \
 } while (false)
 
 #endif
