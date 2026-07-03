@@ -203,24 +203,6 @@ static inline void _apply_style(FILE *to, Printer p) {
             p.style.color.r, p.style.color.g, p.style.color.b);
 }
 
-/* Helper - add padding (should add delay) */
-static inline void _add_pad(FILE *to, int8_t *side, int32_t space, int32_t *remaining) {
-    if (!side) return;
-
-    int32_t pad_size = strlen((char *)side);
-    while (*remaining < space) {
-        if (*remaining + pad_size <= space) {
-            fprintf(to, "%s", side);
-            (*remaining) += pad_size;
-        } else {
-            int32_t fill = space - (*remaining);
-            for (int32_t idx = 0; idx < fill; idx++)
-                fprintf(to, "%c", side[idx]);
-            (*remaining) = space;
-        }
-    }
-}
-
 /* Helper - input interpreter */
 static inline void _interpret_input(Printer p, bool *should_ff) {
     if (!p.dynamic.speedup) return;
@@ -241,10 +223,45 @@ static inline void _interpret_input(Printer p, bool *should_ff) {
     }
 }
 
+/* Helper - add padding */
+static inline void _add_pad(FILE *to, int8_t *side, int32_t space,
+    int32_t *remaining, Printer p, bool *fast_f) {
+    if (!side) return;
+
+    int32_t pad_size = strlen((char *)side);
+    int32_t ms = p.dynamic.delay;
+
+    while (*remaining < space) {
+        if (*remaining + pad_size <= space) {
+            for (int8_t *s = side; *s; s++) {
+                _interpret_input(p, fast_f);
+                fprintf(to, "%c", *s);
+                if (ms) {
+                    fflush(to);
+                    (*fast_f) ? usleep(ms / 5 * 1000) : usleep(ms * 1000);
+                }
+            }
+            (*remaining) += pad_size;
+        } else {
+            int32_t fill = space - (*remaining);
+            for (int32_t idx = 0; idx < fill; idx++) {
+                _interpret_input(p, fast_f);
+                fprintf(to, "%c", side[idx]);
+                if (ms) {
+                    fflush(to);
+                    (*fast_f) ? usleep(ms / 5 * 1000) : usleep(ms * 1000);
+                }
+            }
+            (*remaining) = space;
+        }
+    }
+}
+
 /* Helper - correctly apply background for newlines */
 static inline void _print_asc(FILE *to, int8_t *s, bool has_bg) {
+    bool tty = isatty(fileno(to));
     while (*s) {
-        if (*s == '\n' && has_bg) fprintf(to, endline);
+        if (*s == '\n' && tty && has_bg) fprintf(to, endline);
         fprintf(to, "%c", *s);
         s++;
     }
@@ -253,33 +270,38 @@ static inline void _print_asc(FILE *to, int8_t *s, bool has_bg) {
 /* Helper - print text */
 static inline void _add_char(FILE *to, Printer p) {
     size_t text_size = strlen(p.text);
-    int32_t available_space = p.width - text_size;
-    int32_t extra = 0;
-
-    _add_pad(to, p.lpad, available_space, &extra);
 
     bool fast_f = false;
     int32_t ms = p.dynamic.delay;
+    bool tty = isatty(fileno(to));
     for (int32_t step = 0; step < p.repeat; step++) {
-        int8_t size = 0;
+        _print_asc(to, p.start, p.style.background.set);
+
+        int32_t available_space = p.width - text_size;
+        int32_t extra = 0;
+
+        _add_pad(to, p.lpad, available_space, &extra, p, &fast_f);
+        int32_t size = 0;
         for (int8_t *s = p.text; *s; s++, size++) {
             if (!p.wrap && size == p.width) break;
 
             _interpret_input(p, &fast_f);
 
-            if (*s == '\n') fprintf(to, endline);
+            if (*s == '\n' && tty && p.style.background.set) fprintf(to, endline);
             fprintf(to, "%c", *s);
-            if (ms) fflush(to);
-
-            (fast_f) ? usleep(ms / 5 * 1000) : usleep(ms * 1000);
+            if (ms) {
+                fflush(to);
+                (fast_f) ? usleep(ms / 5 * 1000) : usleep(ms * 1000);
+            }
 
             if (p.wrap && size == p.width - 1) _print_asc(to, "\n", p.style.background.set), size = -1;
         }
+        _add_pad(to, p.rpad, available_space, &extra, p, &fast_f);
+
+        if (!extra) for (int32_t idx = 0; idx < available_space; idx++) fprintf(to, " ");
+
+        _print_asc(to, p.end, p.style.background.set);
     }
-
-    _add_pad(to, p.rpad, available_space, &extra);
-
-    if (!extra) for (int32_t idx = 0; idx < available_space; idx++) fprintf(to, " ");
 }
 
 /* Printer constructor */
@@ -326,11 +348,13 @@ static inline void _use_printer(Printer p) {
     if (p.dynamic.cursor) fprintf(to, CURSOR_H);
 
     _apply_style(to, p);
-    _print_asc(to, p.start, p.style.background.set);
+    // _print_asc(to, p.start, p.style.background.set);
     _add_char(to, p);
-    _print_asc(to, p.end, p.style.background.set);
-    fprintf(to, RESET_STYLE);
-    fprintf(to, endline);
+    // _print_asc(to, p.end, p.style.background.set);
+    if (isatty(fileno(to))) {
+        fprintf(to, RESET_STYLE);
+        fprintf(to, endline);
+    }
     if (p.dynamic.cursor) fprintf(to, CURSOR_S);
 
     if (strcmp(p.out, "stdout")) fclose(to);
