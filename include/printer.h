@@ -8,16 +8,23 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdarg.h>
+#include <ctype.h>
 #include <unistd.h>
+
+#ifdef _WIN32
+    #include <windows.h>
+#else
+    #include <sys/ioctl.h>
+#endif
 
 /* Define input interpreter */
 #ifdef _WIN32  // Windows compatible
 
 #include <conio.h>
 
-typedef int TerminalState;
+typedef int32_t TerminalState;
 static inline int portable_getch(void) { return getch(); }
-static inline int portable_ungetch(int ch) { return ungetch(ch); }
+static inline int portable_ungetch(int32_t ch) { return ungetch(ch); }
 static inline int portable_kbhit(void) { return kbhit(); }
 static inline TerminalState enable_raw(void) { return 0; }
 static inline void disable_raw(TerminalState ts) { (void)ts; }
@@ -59,6 +66,117 @@ static inline int portable_kbhit(void) {
 
 #endif // defined input interpreter for POSIX
 
+/* TerminalCursor definition */
+typedef struct _terminal_cursor {
+    size_t x;
+    size_t y;
+} TerminalCursor;
+
+/* TerminalDimensiona definition */
+typedef struct _terminal_dimensions {
+    size_t rows;
+    size_t cols;
+} TerminalDimensions;
+
+/* Terminal definition */
+typedef struct _temrinal {
+    TerminalDimensions dimensions;
+    TerminalState state;
+    TerminalCursor cursor;
+    bool buffered;
+} Terminal;
+
+/* Helper - get current terminal size */
+static inline TerminalDimensions getTerminalDimensions() {
+    TerminalDimensions td = {0};
+
+    #ifdef _WIN32
+
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+
+    GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi);
+    td.cols = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+    td.rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+
+    #else
+
+    struct winsize w;
+    ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
+
+    td.rows = w.ws_row;
+    td.cols = w.ws_col;
+
+    #endif
+
+    return td;
+}
+
+/* Terminal constructor */
+static inline Terminal initTerminal() {
+    Terminal t = {0};
+
+    t.dimensions = getTerminalDimensions();
+    t.cursor = (TerminalCursor){1, 1};
+    t.buffered = true;
+
+    return t;
+}
+
+/* Dynamic terminal API */
+static inline void terminalEnableRaw(Terminal *t) { t->state = enable_raw(); }
+static inline void terminalDisableRaw(Terminal *t) { disable_raw(t->state); }
+static inline void terminalDisableBuffer(Terminal *t) {
+    if (!t->buffered) return;
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+    t->buffered = false;
+}
+static inline void terminalEnableBuffer(Terminal *t) {
+    if (t->buffered) return;
+
+    setvbuf(stdout, NULL, _IOFBF, BUFSIZ);
+    t->buffered = true;
+}
+
+/* RowRelativeMovement definition */
+typedef enum _row_relative_movement {
+    up = 1,
+    down
+} RowRelativeMovement;
+
+/* Row relative movement */
+static inline void move_row(RowRelativeMovement rrm, size_t row) {
+    switch (rrm) {
+        case up:
+            printf("\x1b[%ldA", row);
+            break;
+        case down:
+            printf("\x1b[%ldB", row);
+            break;
+        default: break;
+    }
+}
+
+/* ColRelativeMovement definition */
+typedef enum _col_relative_movement {
+    left = 1,
+    right,
+    center
+} ColRelativeMovement;
+
+/* Col relative movement */
+static inline void move_col(ColRelativeMovement crm, size_t col) {
+    switch (crm) {
+        case left:
+            printf("\x1b[%ldD", col);
+            break;
+        case right:
+            printf("\x1b[%ldC", col);
+            break;
+        default: break;
+    }
+}
+
 /* Color type */
 typedef struct _color {
     int16_t r;
@@ -68,7 +186,7 @@ typedef struct _color {
 } Color;
 
 /* Color constructor */
-Color _new_color(Color defaults) {
+static inline Color _new_color(Color defaults) {
     return (Color) {
         .r = defaults.r,
         .g = defaults.g,
@@ -109,30 +227,39 @@ typedef enum _stroke {
 
 /* Move cursor to the end of the current line */
 #define endline "\033[K"
+/* Move cursor to the next line */
+#define newline "\n"
+/* Clear the active screen and move the cursor to (1, 1) */
+#define clrscrn .text = "\033[2J\033[H", .style = style(.clear = bleed)
 
 /* Style type */
 typedef struct _style_args {
     Color color;
     Stroke stroke;
     Color background;
+    int8_t clear;
 } StyleArgs;
 
 /* Style constructor */
-StyleArgs _new_style_args(StyleArgs defaults) {
+static inline StyleArgs _new_style_args(StyleArgs defaults) {
     StyleArgs sta = {0};
 
     sta.color = defaults.color;
     sta.background = defaults.background;
     sta.stroke = defaults.stroke;
+    sta.clear = defaults.clear;
 
     return sta;
 }
 
+#define bleed -1
+
 /**
  * Define a new output style.
- * @param .color  (default: terminal theme) Set the foreground (text) color
- * @param .stroke (default: terminal theme) Set the foreground (text) stroke
- * @param .background (default: terminal theme) Set the background color
+ * @param .color      (default: terminal theme) Set the foreground (text) color.
+ * @param .stroke     (default: terminal theme) Set the foreground (text) stroke.
+ * @param .background (default: terminal theme) Set the background color.
+ * @param .clear      (default: restore terminal theme) Specify if style bleeds.
  * @return new StyleArgs object
  */
 #define style(...) _new_style_args((StyleArgs){__VA_ARGS__})
@@ -145,26 +272,27 @@ typedef struct _dynamic_args {
     int32_t delay;
     bool cursor;
     int8_t *speedup;
-    bool _enable_raw;
+    bool raw;
 } DynamicArgs;
 
 /* Dynamic constructor */
-DynamicArgs _new_dynamic_args(DynamicArgs defaults) {
+static inline DynamicArgs _new_dynamic_args(DynamicArgs defaults) {
     DynamicArgs da = {0};
 
     da.delay = defaults.delay;
     da.cursor = defaults.cursor;
     da.speedup = defaults.speedup;
-    da._enable_raw = true;
+    da.raw = defaults.raw;
 
     return da;
 }
 
 /**
  * Define a new output behaviour.
- * @param .delay   (default: 0) Set the time between printing characters
- * @param .cursor  (default: show) Set cursor visibility
- * @param .speedup (default: none) Keys which decrease printing time
+ * @param .delay   (default: 0) Set the time between printing characters.
+ * @param .cursor  (default: show) Set cursor visibility.
+ * @param .speedup (default: none) Keys which decrease printing time.
+ * @param .raw     (default: false) Force terminal into raw mode.
  * @return new DynamicArgs object
  */
 #define dynamic(...) _new_dynamic_args((DynamicArgs){__VA_ARGS__})
@@ -184,6 +312,7 @@ typedef struct _printer {
     int8_t *start;
     int8_t *end;
     int8_t *out;
+    ColRelativeMovement align;
     StyleArgs style;
     int32_t repeat;
     DynamicArgs dynamic;
@@ -201,6 +330,33 @@ static inline void _apply_style(FILE *to, Printer p) {
     if (p.style.color.set)
         fprintf(to, "\x1b[38;2;%d;%d;%dm",
             p.style.color.r, p.style.color.g, p.style.color.b);
+}
+
+/* Helper - move cursor into position */
+static inline void _add_alignment(FILE *to, Printer p) {
+    if (p.align == left) return;
+
+    TerminalDimensions td = getTerminalDimensions();
+
+    size_t slen = strlen(p.start);
+    size_t sspace = 0;
+    for (size_t idx = 0; idx < slen; idx++) sspace = (isprint(p.start[idx]) != 0) ? sspace + 1 : sspace;
+
+    size_t elen = strlen(p.end);
+    size_t espace = 0;
+    for (size_t idx = 0; idx < elen; idx++) espace = (isprint(p.end[idx]) != 0) ? espace + 1 : espace;
+
+    switch (p.align) {
+        case right:
+            fprintf(to, "\r");
+            move_col(right, (td.cols - p.width - sspace - espace));
+            break;
+        case center:
+            fprintf(to, "\r");
+            move_col(right, (td.cols - p.width - sspace - espace) / 2);
+            break;
+        default: break;
+    }
 }
 
 /* Helper - input interpreter */
@@ -258,10 +414,10 @@ static inline void _add_pad(FILE *to, int8_t *side, int32_t space,
 }
 
 /* Helper - correctly apply background for newlines */
-static inline void _print_asc(FILE *to, int8_t *s, bool has_bg) {
+static inline void _print_asc(FILE *to, int8_t *s, bool has_bg, ColRelativeMovement crm) {
     bool tty = isatty(fileno(to));
     while (*s) {
-        if (*s == '\n' && tty && has_bg) fprintf(to, endline);
+        if (*s == '\n' && tty && has_bg && crm != right) fprintf(to, endline);
         fprintf(to, "%c", *s);
         s++;
     }
@@ -274,8 +430,11 @@ static inline void _add_char(FILE *to, Printer p) {
     bool fast_f = false;
     int32_t ms = p.dynamic.delay;
     bool tty = isatty(fileno(to));
+
+    _add_alignment(to, p);
+
     for (int32_t step = 0; step < p.repeat; step++) {
-        _print_asc(to, p.start, p.style.background.set);
+        _print_asc(to, p.start, p.style.background.set, p.align);
 
         int32_t available_space = p.width - text_size;
         int32_t extra = 0;
@@ -287,20 +446,24 @@ static inline void _add_char(FILE *to, Printer p) {
 
             _interpret_input(p, &fast_f);
 
-            if (*s == '\n' && tty && p.style.background.set) fprintf(to, endline);
+            if (*s == '\n' && tty && p.style.background.set && p.align != right) fprintf(to, endline);
             fprintf(to, "%c", *s);
             if (ms) {
                 fflush(to);
                 (fast_f) ? usleep(ms / 5 * 1000) : usleep(ms * 1000);
             }
 
-            if (p.wrap && size == p.width - 1) _print_asc(to, "\n", p.style.background.set), size = -1;
+            if (p.wrap && size == p.width - 1) {
+                _print_asc(to, "\n", p.style.background.set, p.align);
+                _add_alignment(to, p);
+                size = -1;
+            }
         }
         _add_pad(to, p.rpad, available_space, &extra, p, &fast_f);
 
         if (!extra) for (int32_t idx = 0; idx < available_space; idx++) fprintf(to, " ");
 
-        _print_asc(to, p.end, p.style.background.set);
+        _print_asc(to, p.end, p.style.background.set, p.align);
     }
 }
 
@@ -348,15 +511,14 @@ static inline void _use_printer(Printer p) {
     if (p.dynamic.cursor) fprintf(to, CURSOR_H);
 
     _apply_style(to, p);
-    // _print_asc(to, p.start, p.style.background.set);
     _add_char(to, p);
-    // _print_asc(to, p.end, p.style.background.set);
-    if (isatty(fileno(to))) {
+
+    if (p.style.clear != bleed && isatty(fileno(to))) {
         fprintf(to, RESET_STYLE);
         fprintf(to, endline);
     }
-    if (p.dynamic.cursor) fprintf(to, CURSOR_S);
 
+    if (p.dynamic.cursor) fprintf(to, CURSOR_S);
     if (strcmp(p.out, "stdout")) fclose(to);
 }
 
@@ -373,10 +535,11 @@ static inline void _use_printer(Printer p) {
  * @param .style (default: terminal specific) Specify styling options.
  * @param .dynamic (default: static) Specify terminal behaviour.
  * @param .repeat (default: 0) Repeats the text a number of times
+ * @param .align (default: none) Justify options.
  */
 #define print(...) do { \
     Printer _p = _makePrinter((Printer){__VA_ARGS__}); \
-    if (_p.dynamic._enable_raw) { \
+    if (_p.dynamic.raw) { \
         TerminalState _ts = enable_raw(); \
         _use_printer(_p); \
         disable_raw(_ts); \
