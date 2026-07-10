@@ -79,7 +79,7 @@ typedef struct _terminal_dimensions {
 } TerminalDimensions;
 
 /* Terminal definition */
-typedef struct _temrinal {
+typedef struct _terminal {
     TerminalDimensions dimensions;
     TerminalState state;
     TerminalCursor cursor;
@@ -87,7 +87,7 @@ typedef struct _temrinal {
 } Terminal;
 
 /* Helper - get current terminal size */
-static inline TerminalDimensions getTerminalDimensions() {
+static inline TerminalDimensions getTerminalDimensions(void) {
     TerminalDimensions td = {0};
 
     #ifdef _WIN32
@@ -112,7 +112,7 @@ static inline TerminalDimensions getTerminalDimensions() {
 }
 
 /* Terminal constructor */
-static inline Terminal initTerminal() {
+static inline Terminal initTerminal(void) {
     Terminal t = {0};
 
     t.dimensions = getTerminalDimensions();
@@ -302,20 +302,46 @@ static inline DynamicArgs _new_dynamic_args(DynamicArgs defaults) {
 /* Cursor visibility option */
 #define show false
 
+typedef enum _wrap_option {
+    force = 1,
+    terminal,
+    word
+} WrapOption;
+
+typedef struct _layout {
+    ColRelativeMovement align;
+    int32_t width;
+    WrapOption wrap;
+} LayoutArgs;
+
+LayoutArgs _new_layout_args(LayoutArgs defaults) {
+    LayoutArgs la = {0};
+
+    la.align = (defaults.align) ? defaults.align : left;
+    // la.width = (defaults.width) ? defaults.width : 80;
+    la.width = defaults.width;
+    la.wrap = defaults.wrap;
+
+    return la;
+}
+
+#define layout(...) _new_layout_args((LayoutArgs){__VA_ARGS__})
+
 /* Printer definition */
 typedef struct _printer {
     int8_t *text;
-    int32_t width;
-    bool wrap;
+    // int32_t width;
+    // bool wrap;
     int8_t *lpad;
     int8_t *rpad;
     int8_t *start;
     int8_t *end;
     int8_t *out;
-    ColRelativeMovement align;
+    // ColRelativeMovement align;
     StyleArgs style;
     int32_t repeat;
     DynamicArgs dynamic;
+    LayoutArgs layout;
 } Printer;
 
 /* Helper - apply style */
@@ -334,7 +360,7 @@ static inline void _apply_style(FILE *to, Printer p) {
 
 /* Helper - move cursor into position */
 static inline void _add_alignment(FILE *to, Printer p) {
-    if (p.align == left) return;
+    if (p.layout.align == left) return;
 
     TerminalDimensions td = getTerminalDimensions();
 
@@ -346,14 +372,17 @@ static inline void _add_alignment(FILE *to, Printer p) {
     size_t espace = 0;
     for (size_t idx = 0; idx < elen; idx++) espace = (isprint(p.end[idx]) != 0) ? espace + 1 : espace;
 
-    switch (p.align) {
+    size_t tlen = strlen(p.text);
+    int32_t base_width = (!p.layout.width) ? tlen : p.layout.width;
+    int32_t new_col = td.cols - ((int32_t)(base_width + sspace + espace));
+    switch (p.layout.align) {
         case right:
             fprintf(to, "\r");
-            move_col(right, (td.cols - p.width - sspace - espace));
+            move_col(right, (new_col));
             break;
         case center:
             fprintf(to, "\r");
-            move_col(right, (td.cols - p.width - sspace - espace) / 2);
+            move_col(right, (new_col) / 2);
             break;
         default: break;
     }
@@ -414,13 +443,34 @@ static inline void _add_pad(FILE *to, int8_t *side, int32_t space,
 }
 
 /* Helper - correctly apply background for newlines */
-static inline void _print_asc(FILE *to, int8_t *s, bool has_bg, ColRelativeMovement crm) {
+static inline void _print_asc(FILE *to, int8_t *s, Printer p) {
     bool tty = isatty(fileno(to));
-    while (*s) {
-        if (*s == '\n' && tty && has_bg && crm != right) fprintf(to, endline);
-        fprintf(to, "%c", *s);
-        s++;
+    size_t slen = strlen(s);
+    bool check = (slen != 1);
+
+    for (size_t idx = 0; idx < slen; idx++) {
+        if (s[idx] == '\n' && tty && p.style.background.set && p.layout.align != right) fprintf(to, endline);
+
+        fprintf(to, "%c", s[idx]);
+
+        if (s[idx] == '\n' && check && idx != slen - 1) _add_alignment(to, p);
     }
+}
+
+size_t _find_word_length(int8_t *word, Printer p) {
+    size_t wlen = 0;
+
+    if ((word == p.text || *(word - 1) == ' ') &&
+        *word != ' ' && *word != '\n' && *word != '\t' && *word != '\r') {
+
+        int8_t *iter = word;
+        while (*iter && *iter != ' ' && *iter != '\n' && *iter != '\t' && *iter != '\r') {
+            wlen++;
+            iter++;
+        }
+    }
+
+    return wlen;
 }
 
 /* Helper - print text */
@@ -431,30 +481,48 @@ static inline void _add_char(FILE *to, Printer p) {
     int32_t ms = p.dynamic.delay;
     bool tty = isatty(fileno(to));
 
-    _add_alignment(to, p);
+    TerminalDimensions td = getTerminalDimensions();
+    WrapOption wo = p.layout.wrap;
+    int32_t base_width = (!p.layout.width) ? text_size : p.layout.width;
+    int32_t computed_width = (wo == terminal) ? td.cols : base_width;
 
     for (int32_t step = 0; step < p.repeat; step++) {
-        _print_asc(to, p.start, p.style.background.set, p.align);
+        _add_alignment(to, p);
+        _print_asc(to, p.start, p);
 
-        int32_t available_space = p.width - text_size;
+        int32_t available_space = base_width - text_size;
         int32_t extra = 0;
 
         _add_pad(to, p.lpad, available_space, &extra, p, &fast_f);
         int32_t size = 0;
         for (int8_t *s = p.text; *s; s++, size++) {
-            if (!p.wrap && size == p.width) break;
+            if (!p.layout.wrap && size == base_width) break;
 
             _interpret_input(p, &fast_f);
 
-            if (*s == '\n' && tty && p.style.background.set && p.align != right) fprintf(to, endline);
+            if ((wo == word || wo == terminal)) {
+                int8_t *src = (*s == ' ') ? s + 1 : s;
+                size_t wlen = _find_word_length(src, p);
+                int32_t rst = (*s == ' ') ? 1 : 0;
+
+                if (size && wlen + size + rst > computed_width) {
+                    _print_asc(to, "\n", p);
+                    _add_alignment(to, p);
+                    size = -1;
+
+                    if (*s == ' ') continue;
+                }
+            }
+
+            if (*s == '\n' && tty && p.style.background.set && p.layout.align != right) fprintf(to, endline);
             fprintf(to, "%c", *s);
             if (ms) {
                 fflush(to);
                 (fast_f) ? usleep(ms / 5 * 1000) : usleep(ms * 1000);
             }
 
-            if (p.wrap && size == p.width - 1) {
-                _print_asc(to, "\n", p.style.background.set, p.align);
+            if (p.layout.wrap == force && size == computed_width - 1) {
+                _print_asc(to, "\n", p);
                 _add_alignment(to, p);
                 size = -1;
             }
@@ -463,7 +531,7 @@ static inline void _add_char(FILE *to, Printer p) {
 
         if (!extra) for (int32_t idx = 0; idx < available_space; idx++) fprintf(to, " ");
 
-        _print_asc(to, p.end, p.style.background.set, p.align);
+        _print_asc(to, p.end, p);
     }
 }
 
@@ -472,7 +540,7 @@ static inline Printer _makePrinter(struct _printer defaults) {
     Printer p = defaults;
 
     p.text = (p.text) ? p.text : (int8_t *)("");
-    p.width = (p.width == 0) ? strlen(p.text) : p.width;
+    // p.width = (p.width == 0) ? strlen(p.text) : p.width;
     p.lpad = (p.lpad) ? p.lpad : NULL;
     p.rpad = (p.rpad) ? p.rpad : NULL;
     p.start = (p.start) ? p.start : (int8_t *)("");
@@ -480,6 +548,7 @@ static inline Printer _makePrinter(struct _printer defaults) {
     p.out = (p.out) ? p.out : (int8_t *)("stdout");
     p.repeat = (p.repeat == 0) ? 1 : p.repeat;
     p.dynamic.speedup = (p.dynamic.speedup) ? p.dynamic.speedup : NULL;
+    p.layout = defaults.layout;
 
     return p;
 }
