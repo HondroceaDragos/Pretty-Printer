@@ -10,11 +10,13 @@
 #include <stdarg.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
 #ifdef _WIN32
     #include <windows.h>
 #else
     #include <sys/ioctl.h>
+    #include <pthread.h>
 #endif
 
 /* Define input interpreter */
@@ -318,7 +320,6 @@ LayoutArgs _new_layout_args(LayoutArgs defaults) {
     LayoutArgs la = {0};
 
     la.align = (defaults.align) ? defaults.align : left;
-    // la.width = (defaults.width) ? defaults.width : 80;
     la.width = defaults.width;
     la.wrap = defaults.wrap;
 
@@ -330,14 +331,11 @@ LayoutArgs _new_layout_args(LayoutArgs defaults) {
 /* Printer definition */
 typedef struct _printer {
     int8_t *text;
-    // int32_t width;
-    // bool wrap;
     int8_t *lpad;
     int8_t *rpad;
     int8_t *start;
     int8_t *end;
     int8_t *out;
-    // ColRelativeMovement align;
     StyleArgs style;
     int32_t repeat;
     DynamicArgs dynamic;
@@ -388,23 +386,95 @@ static inline void _add_alignment(FILE *to, Printer p) {
     }
 }
 
+typedef struct _dynamic_thread {
+    #ifdef _WIN32
+        HANDLE body;
+    #else
+        pthread_t body;
+    #endif
+
+    atomic_bool shouldListen;
+    atomic_int_fast32_t lastKey;
+
+    void *(*listen)(void *);
+    void (*store)(struct _dynamic_thread *);
+    int32_t (*load)(struct _dynamic_thread *);
+    int32_t (*consume)(struct _dynamic_thread *);
+    bool (*peek)(struct _dynamic_thread *);
+} InputThread;
+
+static void _input_store(InputThread *t) {
+    atomic_store(&(t->lastKey), portable_getch());
+}
+
+static int32_t _input_load(InputThread *t) {
+    return atomic_load(&(t->lastKey));
+}
+
+static int32_t _input_consume(InputThread *t) {
+    return atomic_exchange(&(t->lastKey), -1);
+}
+
+static bool _input_peek(InputThread *t) {
+    return atomic_load(&(t->lastKey)) != -1;
+}
+
+InputThread _input_thread = {
+    .shouldListen = true,
+    .lastKey = -1,
+    .store = _input_store,
+    .load = _input_load,
+    .consume = _input_consume,
+    .peek = _input_peek
+};
+
+static void *_input_listen(void *) {
+    while (atomic_load(&(_input_thread.shouldListen))) {
+        if (!portable_kbhit()) {
+            usleep(1000);  // yield
+            continue;
+        }
+        _input_thread.store(&_input_thread);
+    }
+    return NULL;
+}
+
+#ifdef _WIN32
+    static inline void startInputListener(void) {
+        atomic_store(&(_input_thread.shouldListen), true);
+        _input_thread.body = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)_input_listen, NULL, 0, NULL);
+    }
+    static inline void stopInputListener(void) {
+        atomic_store(&(_input_thread.shouldListen), false);
+        WaitForSingleObject(_input_thread.body, INFINITE);
+        CloseHandle(_input_thread.body);
+    }
+#else
+    static inline void startInputListener(void) {
+        atomic_store(&(_input_thread.shouldListen), true);
+        pthread_create(&(_input_thread.body), NULL, _input_listen, NULL);
+    }
+    static inline void stopInputListener(void) {
+        atomic_store(&(_input_thread.shouldListen), false);
+        pthread_join((_input_thread.body), NULL);
+    }
+#endif
+
+#define _use_thread(t, func) t.func(&t)
+
 /* Helper - input interpreter */
 static inline void _interpret_input(Printer p, bool *should_ff) {
-    if (!p.dynamic.speedup) return;
+    if (!p.dynamic.speedup || !_use_thread(_input_thread, peek)) return;
 
-    bool match = false;
-    if (portable_kbhit()) {
-        int key_pressed = portable_getch();
-        size_t speed_len = strlen(p.dynamic.speedup);
-        for (size_t idx = 0; idx < speed_len; idx++) {
-            if (key_pressed == p.dynamic.speedup[idx]) {
-                match = true;
-                break;
-            }
+    int32_t key = _use_thread(_input_thread, load);
+
+    size_t slen = strlen(p.dynamic.speedup);
+    for (size_t idx = 0; idx < slen; idx++) {
+        if (key == p.dynamic.speedup[idx]) {
+            _use_thread(_input_thread, consume);
+            *should_ff = !(*should_ff);
+            return;
         }
-
-        if (match) (*should_ff) = !(*should_ff);
-        else portable_ungetch(key_pressed);
     }
 }
 
@@ -420,7 +490,11 @@ static inline void _add_pad(FILE *to, int8_t *side, int32_t space,
         if (*remaining + pad_size <= space) {
             for (int8_t *s = side; *s; s++) {
                 _interpret_input(p, fast_f);
+
+                if (*s == '\n') fprintf(to, endline);
                 fprintf(to, "%c", *s);
+                if (*s == '\n') _add_alignment(to, p);
+
                 if (ms) {
                     fflush(to);
                     (*fast_f) ? usleep(ms / 5 * 1000) : usleep(ms * 1000);
@@ -431,7 +505,11 @@ static inline void _add_pad(FILE *to, int8_t *side, int32_t space,
             int32_t fill = space - (*remaining);
             for (int32_t idx = 0; idx < fill; idx++) {
                 _interpret_input(p, fast_f);
+
+                if (side[idx] == '\n') fprintf(to, endline);
                 fprintf(to, "%c", side[idx]);
+                if (side[idx] == '\n') _add_alignment(to, p);
+
                 if (ms) {
                     fflush(to);
                     (*fast_f) ? usleep(ms / 5 * 1000) : usleep(ms * 1000);
@@ -486,6 +564,7 @@ static inline void _add_char(FILE *to, Printer p) {
     int32_t base_width = (!p.layout.width) ? text_size : p.layout.width;
     int32_t computed_width = (wo == terminal) ? td.cols : base_width;
 
+    startInputListener();
     for (int32_t step = 0; step < p.repeat; step++) {
         _add_alignment(to, p);
         _print_asc(to, p.start, p);
@@ -533,6 +612,7 @@ static inline void _add_char(FILE *to, Printer p) {
 
         _print_asc(to, p.end, p);
     }
+    stopInputListener();
 }
 
 /* Printer constructor */
@@ -540,7 +620,6 @@ static inline Printer _makePrinter(struct _printer defaults) {
     Printer p = defaults;
 
     p.text = (p.text) ? p.text : (int8_t *)("");
-    // p.width = (p.width == 0) ? strlen(p.text) : p.width;
     p.lpad = (p.lpad) ? p.lpad : NULL;
     p.rpad = (p.rpad) ? p.rpad : NULL;
     p.start = (p.start) ? p.start : (int8_t *)("");
