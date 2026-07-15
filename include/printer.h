@@ -651,6 +651,162 @@ static inline int8_t *_fmt(int8_t *buff, size_t buff_size, int8_t *fmt, ...) {
 #define CURSOR_S "\033[?25h"
 #define CURSOR_H "\033[?25l"
 
+#define RESET_COLOR "\x1b[39m"
+#define RESET_BACKGROUND "\x1b[49m"
+#define RESET_BOLD "\x1b[22m"
+#define RESET_ITALIC "\x1b[23m"
+#define RESET_UNDERLINE "\x1b[24m"
+
+void _add_char_inline(FILE *to, Printer p) {
+    int8_t *text = p.text;
+    size_t tlen = strlen(text);
+
+    int8_t style_op[5] = {0};
+
+    int8_t style_args[5][64];
+    size_t args_count = 0;
+    size_t args_len = 0;
+
+    bool use_ctx = false;
+    size_t call_count = 0;
+
+    StyleArgs style = p.style;
+    DynamicArgs dynamic = p.dynamic;
+
+    int8_t buffer[2048] = {0};
+    size_t bidx = 0;
+    for (size_t idx = 0; idx < tlen; idx++) {
+        if (text[idx] != '[') {
+            buffer[bidx++] = text[idx];
+            continue;
+        }
+
+        if (idx + 1 < tlen && text[idx + 1] == '[') {
+            buffer[bidx++] = '[';
+            continue;
+        }
+
+        size_t ctx_start = idx++;
+
+        args_count = 0;
+        args_len = 0;
+        style_args[0][0] = '\0';
+        use_ctx = false;
+
+        while (idx < tlen && text[idx] != ']') {
+            while (idx < tlen && text[idx] == ' ') idx++;
+            if (idx >= tlen || text[idx] == ']') break;
+
+            style_op[args_count] = text[idx++];
+
+            while (idx < tlen && text[idx] == ' ') idx++;
+            if (idx < tlen && text[idx] == ':') idx++;
+            while (idx < tlen && text[idx] == ' ') idx++;
+
+            args_len = 0;
+
+            while (idx < tlen && text[idx] != ',' && text[idx] != ']') {
+                if (text[idx] != ' ') {
+                    style_args[args_count][args_len++] = text[idx];
+                }
+                idx++;
+            }
+
+            style_args[args_count][args_len] = '\0';
+
+            if (style_op[args_count] == '/') {
+                call_count++;
+                use_ctx = true;
+
+                Printer _reset = p;
+                _reset.text = buffer;
+                _reset.style = style;
+                _reset.dynamic = dynamic;
+
+                _reset.start = (call_count == 1) ? _reset.start : (int8_t *)"";
+                _reset.end = (idx == tlen - 1) ? _reset.end : (int8_t *)"";
+
+                if (p.dynamic.cursor) fprintf(to, CURSOR_H);
+
+                _apply_style(to, _reset);
+                _add_char(to, _reset);
+
+                bidx = 0;
+                memset(&buffer, 0, sizeof(buffer));
+
+                style = p.style;
+                dynamic = p.dynamic;
+            } else if (style_args[args_count][0] == '/') {
+                switch (style_op[args_count]) {
+                    case 'c': {
+                        style.color = p.style.color;
+                        use_ctx = true;
+                        break;
+                    }
+                    case 'b': {
+                        style.background = p.style.background;
+                        use_ctx = true;
+                        break;
+                    }
+                    case 's': {
+                        style.stroke = p.style.stroke;
+                        use_ctx = true;
+                        break;
+                    }
+                    case 'd': {
+                        dynamic = p.dynamic;
+                        use_ctx = true;
+                        break;
+                    }
+                    default: break;
+                }
+            } else {
+                switch (style_op[args_count]) {
+                    case 'c': {
+                        style.color = red;
+                        use_ctx = true;
+                        break;
+                    }
+                    case 'b': {
+                        style.background = gray;
+                        use_ctx = true;
+                        break;
+                    }
+                    case 's': {
+                        if (!strcmp(style_args[args_count], "bold"))
+                            {style.stroke |= bold; use_ctx = true;}
+                        if (!strcmp(style_args[args_count], "underline"))
+                            {style.stroke |= underline; use_ctx = true;}
+                        if (!strcmp(style_args[args_count], "italic"))
+                            {style.stroke |= italic; use_ctx = true;}
+                        break;
+                    }
+                    case 'd':
+                        dynamic.delay = atoi(style_args[args_count]);
+                        use_ctx = true;
+                        break;
+                    default: break;
+                }
+            }
+
+            args_count++;
+            if (idx < tlen && text[idx] == ',') idx++;
+        }
+
+        if (idx < tlen && text[idx] == ']') {
+            if (!use_ctx) {
+                Printer _reset = p;
+                _reset.text = buffer;
+                _add_char(to, _reset);
+            } 
+        }
+    }
+
+    p.text = buffer;
+    _apply_style(to, p);
+    _add_char(to, p);
+}
+
 /* Helper - combine all printer options */
 static inline void _use_printer(Printer p) {
     FILE *to = stdout;
@@ -658,8 +814,9 @@ static inline void _use_printer(Printer p) {
     if (strcmp(p.out, "stdout")) to = fopen(p.out, "a");
     if (p.dynamic.cursor) fprintf(to, CURSOR_H);
 
-    _apply_style(to, p);
-    _add_char(to, p);
+    // _apply_style(to, p);
+    // _add_char(to, p);
+    _add_char_inline(to, p);
 
     if (p.style.clear != bleed && isatty(fileno(to))) {
         fprintf(to, RESET_STYLE);
