@@ -161,7 +161,7 @@ static inline void move_row(RowRelativeMovement rrm, size_t row) {
 
 /* ColRelativeMovement definition */
 typedef enum _col_relative_movement {
-    left = 1,
+    left = 0,
     right,
     center
 } ColRelativeMovement;
@@ -197,6 +197,9 @@ static inline Color _new_color(Color defaults) {
     };
 }
 
+/* Print debugging info for colors */
+void debugColor(Color c) { fprintf(stderr, "Color({%d, %d, %d}", c.r, c.g, c.b);}
+
 /**
  * Define a new color using the RGB format.
  * @param .r (default: 0) Set RED channel
@@ -216,9 +219,9 @@ static inline Color _new_color(Color defaults) {
 #define background(...) _new_color((Color){__VA_ARGS__})
 
 /* Default colors */
-#define red _new_color((Color){255, 0, 0})
-#define green _new_color((Color){0, 255, 0})
-#define gray _new_color((Color){128, 128, 128})
+#define red (Color){255, 0, 0, true}
+#define green (Color){0, 255, 0, true}
+#define gray (Color){128, 128, 128, true}
 
 /* Stroke type */
 typedef enum _stroke {
@@ -268,6 +271,124 @@ static inline StyleArgs _new_style_args(StyleArgs defaults) {
 
 /* Return to terminal theme */
 #define RESET_STYLE "\033[0m"
+#define RESET_COLOR "\x1b[39m"
+#define RESET_BACKGROUND "\x1b[49m"
+#define RESET_BOLD "\x1b[22m"
+#define RESET_ITALIC "\x1b[23m"
+#define RESET_UNDERLINE "\x1b[24m"
+
+/* Create a color hashmap for inline styling */
+typedef struct _color_entry {
+    int8_t *id;
+    Color color;
+} ColorEntry;
+
+#define BUCKET_SIZE 8
+
+/* Map definition */
+typedef struct _color_bucket {
+    ColorEntry colors[BUCKET_SIZE];
+    size_t size;
+} ColorBucket;
+
+/* Helper - add a new color to the bucket */
+void _insertColor(ColorBucket *b, int8_t *id, Color c) {
+    if (b->size >= BUCKET_SIZE) return;
+
+    b->colors[b->size].id = id;
+    b->colors[b->size++].color = c;
+}
+
+/* Print debugging information for a color entry */
+void debugColorEntry(int8_t *id, Color c) { fprintf(stderr, "{\"%s\" : Color({%d, %d, %d})}", id, c.r, c.g, c.b); }
+
+void _debugBucket(ColorBucket b) {
+    fprintf(stderr, "Bucket(%ld <= %d) {\n\t", b.size, BUCKET_SIZE);
+    for (size_t idx = 0; idx < b.size; idx++) {
+        debugColorEntry(b.colors[idx].id, b.colors[idx].color);
+        printf(" -> ");
+    }
+    printf("nil\n");
+    printf("}\n");
+}
+
+/* Maximum number of buckets */
+#define DICT_SIZE 24
+
+/* Color dictionary */
+typedef struct _color_dict {
+    ColorBucket buckets[DICT_SIZE];
+
+    size_t (*hash)(int8_t *);
+} ColorDict;
+
+/* Standard string hash */
+size_t djb2(int8_t *key) {
+    size_t seed = 5381;
+    for (int8_t *s = key; *s; s++) seed = seed * 33 + *s;
+    return seed % DICT_SIZE;
+}
+
+/* Color map declaration */
+ColorDict cd = {
+    .hash = djb2,
+    .buckets = {
+        [14] = {
+            .size = 1,
+            .colors = {
+                [0] = {.id = "green", .color = green},
+            }
+        },
+        [16] = {
+            .size = 2,
+            .colors = {
+                [0] = {.id = "red", .color = red},
+                [1] = {.id = "gray", .color = gray},
+            }
+        },
+    }
+};
+
+/* Add new colors to the map */
+void _putColor(ColorDict *cd, int8_t *id, Color color) {
+    size_t idx = cd->hash(id);
+    _insertColor(&cd->buckets[idx], id, color);
+}
+
+/* Get a color from the map */
+Color _getColor(ColorDict *cd, int8_t *id) {
+    size_t src_idx = cd->hash(id);
+    ColorBucket src = cd->buckets[src_idx];
+
+    for (size_t idx = 0; idx < src.size; idx++) {
+        if (!strcmp(src.colors[idx].id, id)) {
+            return src.colors[idx].color;
+        }
+    }
+
+    return color(0, 0, 0);  // will return a color
+}
+
+/* Print map debugging information */
+void debugDict(ColorDict cd) {
+    for (size_t idx = 0; idx < DICT_SIZE; idx++) {
+        printf("[%ld]: ", idx);
+        ColorBucket bucket = cd.buckets[idx];
+        if (!bucket.size) {
+            printf("nil\n");
+            continue;
+        }
+        _debugBucket(bucket);
+    }
+}
+
+/**
+ * @brief Register a new color for the inline interpreter.
+ * @param name String identifier used by the interpreter.
+ * @param clr A Color Object.
+ * @returns none - Adds {name, clr} into cd.
+ */
+#define registerColor(name, clr) _putColor(&cd, (name), (clr))
 
 /* Dynamic type */
 typedef struct _dynamic_args {
@@ -331,15 +452,15 @@ LayoutArgs _new_layout_args(LayoutArgs defaults) {
 /* Printer definition */
 typedef struct _printer {
     int8_t *text;
+    int8_t *end;
+    StyleArgs style;
+    int8_t *out;
+    LayoutArgs layout;
     int8_t *lpad;
     int8_t *rpad;
     int8_t *start;
-    int8_t *end;
-    int8_t *out;
-    StyleArgs style;
-    int32_t repeat;
     DynamicArgs dynamic;
-    LayoutArgs layout;
+    int32_t repeat;
 } Printer;
 
 /* Helper - apply style */
@@ -386,6 +507,7 @@ static inline void _add_alignment(FILE *to, Printer p) {
     }
 }
 
+/* Make typewriter printing thread safe - inputs do not override themselves */
 typedef struct _dynamic_thread {
     #ifdef _WIN32
         HANDLE body;
@@ -403,22 +525,19 @@ typedef struct _dynamic_thread {
     bool (*peek)(struct _dynamic_thread *);
 } InputThread;
 
-static void _input_store(InputThread *t) {
-    atomic_store(&(t->lastKey), portable_getch());
-}
+/* Atomic store */
+static void _input_store(InputThread *t) { atomic_store(&(t->lastKey), portable_getch()); }
 
-static int32_t _input_load(InputThread *t) {
-    return atomic_load(&(t->lastKey));
-}
+/* Atomic load */
+static int32_t _input_load(InputThread *t) { return atomic_load(&(t->lastKey)); }
 
-static int32_t _input_consume(InputThread *t) {
-    return atomic_exchange(&(t->lastKey), -1);
-}
+/* Atomic exchange */
+static int32_t _input_consume(InputThread *t) { return atomic_exchange(&(t->lastKey), -1); }
 
-static bool _input_peek(InputThread *t) {
-    return atomic_load(&(t->lastKey)) != -1;
-}
+/* Check latest input */
+static bool _input_peek(InputThread *t) { return atomic_load(&(t->lastKey)) != -1; }
 
+/* One input thread */
 InputThread _input_thread = {
     .shouldListen = true,
     .lastKey = -1,
@@ -428,6 +547,7 @@ InputThread _input_thread = {
     .peek = _input_peek
 };
 
+/* Await input */
 static void *_input_listen(void *) {
     while (atomic_load(&(_input_thread.shouldListen))) {
         if (!portable_kbhit()) {
@@ -439,6 +559,7 @@ static void *_input_listen(void *) {
     return NULL;
 }
 
+/* Create platform-specific methods */
 #ifdef _WIN32
     static inline void startInputListener(void) {
         atomic_store(&(_input_thread.shouldListen), true);
@@ -449,7 +570,7 @@ static void *_input_listen(void *) {
         WaitForSingleObject(_input_thread.body, INFINITE);
         CloseHandle(_input_thread.body);
     }
-#else
+#else  // POSIX
     static inline void startInputListener(void) {
         atomic_store(&(_input_thread.shouldListen), true);
         pthread_create(&(_input_thread.body), NULL, _input_listen, NULL);
@@ -458,11 +579,15 @@ static void *_input_listen(void *) {
         atomic_store(&(_input_thread.shouldListen), false);
         pthread_join((_input_thread.body), NULL);
     }
-#endif
+#endif  // defined InputThread ops.
 
+/* Helper - ommit thread.self */
 #define _use_thread(t, func) t.func(&t)
 
-/* Helper - input interpreter */
+/** 
+ *  Helper - input interpreter 
+ * Could be changed in 'main' to account for different events
+*/
 static inline void _interpret_input(Printer p, bool *should_ff) {
     if (!p.dynamic.speedup || !_use_thread(_input_thread, peek)) return;
 
@@ -535,6 +660,7 @@ static inline void _print_asc(FILE *to, int8_t *s, Printer p) {
     }
 }
 
+/* Helper - compute a words length based on printable characters */
 size_t _find_word_length(int8_t *word, Printer p) {
     size_t wlen = 0;
 
@@ -551,8 +677,18 @@ size_t _find_word_length(int8_t *word, Printer p) {
     return wlen;
 }
 
+/* Inline Interpreter Object*/
+typedef struct _inline_style {
+    size_t start_idx;
+    StyleArgs style;
+    DynamicArgs dynamic;
+} InlineStyle;
+
+/* Maximum number of custom inline blocks */
+#define INLINE_RUN 64
+
 /* Helper - print text */
-static inline void _add_char(FILE *to, Printer p) {
+static inline void _add_char(FILE *to, Printer p, InlineStyle *runs, size_t ridx) {
     size_t text_size = strlen(p.text);
 
     bool fast_f = false;
@@ -574,8 +710,26 @@ static inline void _add_char(FILE *to, Printer p) {
 
         _add_pad(to, p.lpad, available_space, &extra, p, &fast_f);
         int32_t size = 0;
+        size_t rcount = -1;
         for (int8_t *s = p.text; *s; s++, size++) {
             if (!p.layout.wrap && size == base_width) break;
+
+            /* Apply style and dynamic ops. inline */
+            if (runs) {
+                size_t pos = (size_t)(s - p.text);
+                size_t curr_run = 0;
+                for (size_t jdx = 0; jdx < ridx; jdx++) {
+                    if (runs[jdx].start_idx <= pos) curr_run = jdx;
+                    else break;
+                }
+                if (curr_run != rcount) {
+                    rcount = curr_run;
+                    ms = runs[curr_run].dynamic.delay;
+                    Printer _tmp = p;
+                    _tmp.style = runs[curr_run].style;
+                    _apply_style(to, _tmp);
+                }
+            }
 
             _interpret_input(p, &fast_f);
 
@@ -651,12 +805,9 @@ static inline int8_t *_fmt(int8_t *buff, size_t buff_size, int8_t *fmt, ...) {
 #define CURSOR_S "\033[?25h"
 #define CURSOR_H "\033[?25l"
 
-#define RESET_COLOR "\x1b[39m"
-#define RESET_BACKGROUND "\x1b[49m"
-#define RESET_BOLD "\x1b[22m"
-#define RESET_ITALIC "\x1b[23m"
-#define RESET_UNDERLINE "\x1b[24m"
-
+/* Inline interpreter - strip object arguments and send clear text */
+/* LOOOOONG FUNCTION - cannot create helpers because of VLA's */
+/* Dont want to allocate memory each time- will look into it */
 void _add_char_inline(FILE *to, Printer p) {
     int8_t *text = p.text;
     size_t tlen = strlen(text);
@@ -667,14 +818,19 @@ void _add_char_inline(FILE *to, Printer p) {
     size_t args_count = 0;
     size_t args_len = 0;
 
-    bool use_ctx = false;
-    size_t call_count = 0;
-
     StyleArgs style = p.style;
     DynamicArgs dynamic = p.dynamic;
 
+    bool use_ctx = false;
+
     int8_t buffer[2048] = {0};
     size_t bidx = 0;
+
+    InlineStyle runs[INLINE_RUN];
+    size_t ridx = 0;
+
+    runs[ridx++] = (InlineStyle){.start_idx = 0, .style = style, .dynamic = dynamic};
+
     for (size_t idx = 0; idx < tlen; idx++) {
         if (text[idx] != '[') {
             buffer[bidx++] = text[idx];
@@ -715,27 +871,9 @@ void _add_char_inline(FILE *to, Printer p) {
             style_args[args_count][args_len] = '\0';
 
             if (style_op[args_count] == '/') {
-                call_count++;
-                use_ctx = true;
-
-                Printer _reset = p;
-                _reset.text = buffer;
-                _reset.style = style;
-                _reset.dynamic = dynamic;
-
-                _reset.start = (call_count == 1) ? _reset.start : (int8_t *)"";
-                _reset.end = (idx == tlen - 1) ? _reset.end : (int8_t *)"";
-
-                if (p.dynamic.cursor) fprintf(to, CURSOR_H);
-
-                _apply_style(to, _reset);
-                _add_char(to, _reset);
-
-                bidx = 0;
-                memset(&buffer, 0, sizeof(buffer));
-
                 style = p.style;
                 dynamic = p.dynamic;
+                use_ctx = true;
             } else if (style_args[args_count][0] == '/') {
                 switch (style_op[args_count]) {
                     case 'c': {
@@ -763,12 +901,14 @@ void _add_char_inline(FILE *to, Printer p) {
             } else {
                 switch (style_op[args_count]) {
                     case 'c': {
-                        style.color = red;
+                        Color src = _getColor(&cd, style_args[args_count]);
+                        style.color = src;
                         use_ctx = true;
                         break;
                     }
                     case 'b': {
-                        style.background = gray;
+                        Color src = _getColor(&cd, style_args[args_count]);
+                        style.background = src;
                         use_ctx = true;
                         break;
                     }
@@ -795,16 +935,25 @@ void _add_char_inline(FILE *to, Printer p) {
 
         if (idx < tlen && text[idx] == ']') {
             if (!use_ctx) {
-                Printer _reset = p;
-                _reset.text = buffer;
-                _add_char(to, _reset);
-            } 
+                for (size_t jdx = ctx_start; jdx <= idx; jdx++) {
+                    buffer[bidx++] = text[jdx];
+                }
+            } else if (ridx < INLINE_RUN) {
+                runs[ridx++] = (InlineStyle){.start_idx = bidx, .style = style, .dynamic = dynamic};
+            }
+        } else {
+            for (size_t jdx = ctx_start; jdx <= idx; jdx++) {
+                    buffer[bidx++] = text[jdx];
+            }
         }
     }
 
-    p.text = buffer;
-    _apply_style(to, p);
-    _add_char(to, p);
+    buffer[bidx] = '\0';
+
+    Printer _tmp = p;
+    _tmp.text = buffer;
+    _apply_style(to, _tmp);
+    _add_char(to, _tmp, runs, ridx);
 }
 
 /* Helper - combine all printer options */
@@ -814,9 +963,12 @@ static inline void _use_printer(Printer p) {
     if (strcmp(p.out, "stdout")) to = fopen(p.out, "a");
     if (p.dynamic.cursor) fprintf(to, CURSOR_H);
 
-    // _apply_style(to, p);
-    // _add_char(to, p);
-    _add_char_inline(to, p);
+    if (strchr(p.text, '[')) {
+        _add_char_inline(to, p);
+    } else {
+        _apply_style(to, p);
+        _add_char(to, p, NULL, 0);
+    }
 
     if (p.style.clear != bleed && isatty(fileno(to))) {
         fprintf(to, RESET_STYLE);
