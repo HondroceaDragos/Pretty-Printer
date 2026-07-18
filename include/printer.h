@@ -687,6 +687,21 @@ typedef struct _inline_style {
 /* Maximum number of custom inline blocks */
 #define INLINE_RUN 64
 
+void _interpret_style_inline(FILE *to, StyleArgs sta) {
+    fprintf(to, (sta.stroke & bold) ? "\033[1m" : RESET_BOLD);
+    fprintf(to, (sta.stroke & underline) ? "\033[4m" : RESET_UNDERLINE);
+    fprintf(to, (sta.stroke & italic) ? "\033[3m" : RESET_ITALIC);
+
+    if (sta.background.set)
+        fprintf(to, "\x1b[48;2;%d;%d;%dm", sta.background.r, sta.background.g, sta.background.b);
+    else
+        fprintf(to, RESET_BACKGROUND);
+    if (sta.color.set)
+        fprintf(to, "\x1b[38;2;%d;%d;%dm", sta.color.r, sta.color.g, sta.color.b);
+    else
+        fprintf(to, RESET_COLOR);
+}
+
 /* Helper - print text */
 static inline void _add_char(FILE *to, Printer p, InlineStyle *runs, size_t ridx) {
     size_t text_size = strlen(p.text);
@@ -725,9 +740,7 @@ static inline void _add_char(FILE *to, Printer p, InlineStyle *runs, size_t ridx
                 if (curr_run != rcount) {
                     rcount = curr_run;
                     ms = runs[curr_run].dynamic.delay;
-                    Printer _tmp = p;
-                    _tmp.style = runs[curr_run].style;
-                    _apply_style(to, _tmp);
+                    _interpret_style_inline(to, runs[curr_run].style);
                 }
             }
 
