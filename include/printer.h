@@ -539,7 +539,7 @@ static bool _input_peek(InputThread *t) { return atomic_load(&(t->lastKey)) != -
 
 /* One input thread */
 InputThread _input_thread = {
-    .shouldListen = true,
+    .shouldListen = false,
     .lastKey = -1,
     .store = _input_store,
     .load = _input_load,
@@ -562,20 +562,28 @@ static void *_input_listen(void *) {
 /* Create platform-specific methods */
 #ifdef _WIN32
     static inline void startInputListener(void) {
+        if (atomic_load(&(_input_thread.shouldListen)) == true) return;
+
         atomic_store(&(_input_thread.shouldListen), true);
         _input_thread.body = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)_input_listen, NULL, 0, NULL);
     }
     static inline void stopInputListener(void) {
+        if (atomic_load(&(_input_thread.shouldListen)) == false) return;
+
         atomic_store(&(_input_thread.shouldListen), false);
         WaitForSingleObject(_input_thread.body, INFINITE);
         CloseHandle(_input_thread.body);
     }
 #else  // POSIX
     static inline void startInputListener(void) {
+        if (atomic_load(&(_input_thread.shouldListen)) == true) return;
+
         atomic_store(&(_input_thread.shouldListen), true);
         pthread_create(&(_input_thread.body), NULL, _input_listen, NULL);
     }
     static inline void stopInputListener(void) {
+        if (atomic_load(&(_input_thread.shouldListen)) == false) return;
+
         atomic_store(&(_input_thread.shouldListen), false);
         pthread_join((_input_thread.body), NULL);
     }
@@ -993,19 +1001,43 @@ static inline void _use_printer(Printer p) {
 }
 
 /**
- * Prints text to a specified output stream.
+ * Prints text to a specified output stream. Adds a newline at the end of text.
  * @param .text Printable sequence of characters.
- * @param .width (default: sizeof(.text)) Number of characters being printed.
- * @param .wrap (default: false) Truncate text and move the rest to the next line
+ * @param .end (default: "") Suffix (appended after text).
+ * @param .style (default: terminal specific) Specify styling options.
+ * @param .out (default: stdout) Where text is printed.
+ * @param .layout (default: unwrapped, aligned left) Specify layout options.
  * @param .lpad (default: NULL) Add padding to the left side of text (if able)
  * @param .rpad (default: NULL) Add padding to the right side of text (if able)
  * @param .start (default: "") Prefix (appended before text).
- * @param .end (default: "") Suffix (appended after text).
- * @param .out (default: stdout) Where text is printed.
- * @param .style (default: terminal specific) Specify styling options.
  * @param .dynamic (default: static) Specify terminal behaviour.
  * @param .repeat (default: 0) Repeats the text a number of times
- * @param .align (default: none) Justify options.
+ */
+#define println(...) do { \
+    Printer _p = _makePrinter((Printer){__VA_ARGS__}); \
+    int8_t _ebuf[strlen(_p.end) + 2]; \
+    strncpy(_ebuf, _p.end, strlen(_p.end)); \
+    strcat(_ebuf, "\n\0"); \
+    _p.end = _ebuf; \
+    if (_p.dynamic.raw) { \
+        TerminalState _ts = enable_raw(); \
+        _use_printer(_p); \
+        disable_raw(_ts); \
+    } else _use_printer(_p); \
+} while (false)
+
+/**
+ * Prints text to a specified output stream.
+ * @param .text Printable sequence of characters.
+ * @param .end (default: "") Suffix (appended after text).
+ * @param .style (default: terminal specific) Specify styling options.
+ * @param .out (default: stdout) Where text is printed.
+ * @param .layout (default: unwrapped, aligned left) Specify layout options.
+ * @param .lpad (default: NULL) Add padding to the left side of text (if able)
+ * @param .rpad (default: NULL) Add padding to the right side of text (if able)
+ * @param .start (default: "") Prefix (appended before text).
+ * @param .dynamic (default: static) Specify terminal behaviour.
+ * @param .repeat (default: 0) Repeats the text a number of times
  */
 #define print(...) do { \
     Printer _p = _makePrinter((Printer){__VA_ARGS__}); \
