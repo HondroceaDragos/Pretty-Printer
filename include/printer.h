@@ -179,6 +179,10 @@ static inline void move_col(ColRelativeMovement crm, size_t col) {
     }
 }
 
+static inline void absoluteCursorMove(size_t row, size_t col) {
+    printf("\x1b[%zu;%zuH", row, col);
+}
+
 /* Color type */
 typedef struct _color {
     int16_t r;
@@ -198,7 +202,7 @@ static inline Color _new_color(Color defaults) {
 }
 
 /* Print debugging info for colors */
-void debugColor(Color c) { fprintf(stderr, "Color({%d, %d, %d}", c.r, c.g, c.b);}
+static inline void debugColor(Color c) { fprintf(stderr, "Color({%d, %d, %d}", c.r, c.g, c.b);}
 
 /**
  * Define a new color using the RGB format.
@@ -292,7 +296,7 @@ typedef struct _color_bucket {
 } ColorBucket;
 
 /* Helper - add a new color to the bucket */
-void _insertColor(ColorBucket *b, int8_t *id, Color c) {
+static inline void _insertColor(ColorBucket *b, int8_t *id, Color c) {
     if (b->size >= BUCKET_SIZE) return;
 
     b->colors[b->size].id = id;
@@ -300,9 +304,9 @@ void _insertColor(ColorBucket *b, int8_t *id, Color c) {
 }
 
 /* Print debugging information for a color entry */
-void debugColorEntry(int8_t *id, Color c) { fprintf(stderr, "{\"%s\" : Color({%d, %d, %d})}", id, c.r, c.g, c.b); }
+static inline void debugColorEntry(int8_t *id, Color c) { fprintf(stderr, "{\"%s\" : Color({%d, %d, %d})}", id, c.r, c.g, c.b); }
 
-void _debugBucket(ColorBucket b) {
+static inline void _debugBucket(ColorBucket b) {
     fprintf(stderr, "Bucket(%ld <= %d) {\n\t", b.size, BUCKET_SIZE);
     for (size_t idx = 0; idx < b.size; idx++) {
         debugColorEntry(b.colors[idx].id, b.colors[idx].color);
@@ -323,14 +327,14 @@ typedef struct _color_dict {
 } ColorDict;
 
 /* Standard string hash */
-size_t djb2(int8_t *key) {
+static inline size_t djb2(int8_t *key) {
     size_t seed = 5381;
     for (int8_t *s = key; *s; s++) seed = seed * 33 + *s;
     return seed % DICT_SIZE;
 }
 
 /* Color map declaration */
-ColorDict cd = {
+static ColorDict cd = {
     .hash = djb2,
     .buckets = {
         [14] = {
@@ -350,13 +354,13 @@ ColorDict cd = {
 };
 
 /* Add new colors to the map */
-void _putColor(ColorDict *cd, int8_t *id, Color color) {
+static inline void _putColor(ColorDict *cd, int8_t *id, Color color) {
     size_t idx = cd->hash(id);
     _insertColor(&cd->buckets[idx], id, color);
 }
 
 /* Get a color from the map */
-Color _getColor(ColorDict *cd, int8_t *id) {
+static inline Color _getColor(ColorDict *cd, int8_t *id) {
     size_t src_idx = cd->hash(id);
     ColorBucket src = cd->buckets[src_idx];
 
@@ -370,7 +374,7 @@ Color _getColor(ColorDict *cd, int8_t *id) {
 }
 
 /* Print map debugging information */
-void debugDict(ColorDict cd) {
+static inline void debugDict(ColorDict cd) {
     for (size_t idx = 0; idx < DICT_SIZE; idx++) {
         printf("[%ld]: ", idx);
         ColorBucket bucket = cd.buckets[idx];
@@ -437,7 +441,7 @@ typedef struct _layout {
     WrapOption wrap;
 } LayoutArgs;
 
-LayoutArgs _new_layout_args(LayoutArgs defaults) {
+static inline LayoutArgs _new_layout_args(LayoutArgs defaults) {
     LayoutArgs la = {0};
 
     la.align = (defaults.align) ? defaults.align : left;
@@ -461,6 +465,7 @@ typedef struct _printer {
     int8_t *start;
     DynamicArgs dynamic;
     int32_t repeat;
+    FILE *stream;
 } Printer;
 
 /* Helper - apply style */
@@ -538,7 +543,7 @@ static int32_t _input_consume(InputThread *t) { return atomic_exchange(&(t->last
 static bool _input_peek(InputThread *t) { return atomic_load(&(t->lastKey)) != -1; }
 
 /* One input thread */
-InputThread _input_thread = {
+static InputThread _input_thread = {
     .shouldListen = false,
     .lastKey = -1,
     .store = _input_store,
@@ -669,7 +674,7 @@ static inline void _print_asc(FILE *to, int8_t *s, Printer p) {
 }
 
 /* Helper - compute a words length based on printable characters */
-size_t _find_word_length(int8_t *word, Printer p) {
+static inline size_t _find_word_length(int8_t *word, Printer p) {
     size_t wlen = 0;
 
     if ((word == p.text || *(word - 1) == ' ') &&
@@ -695,7 +700,7 @@ typedef struct _inline_style {
 /* Maximum number of custom inline blocks */
 #define INLINE_RUN 64
 
-void _interpret_style_inline(FILE *to, StyleArgs sta) {
+static inline void _interpret_style_inline(FILE *to, StyleArgs sta) {
     fprintf(to, (sta.stroke & bold) ? "\033[1m" : RESET_BOLD);
     fprintf(to, (sta.stroke & underline) ? "\033[4m" : RESET_UNDERLINE);
     fprintf(to, (sta.stroke & italic) ? "\033[3m" : RESET_ITALIC);
@@ -829,7 +834,7 @@ static inline int8_t *_fmt(int8_t *buff, size_t buff_size, int8_t *fmt, ...) {
 /* Inline interpreter - strip object arguments and send clear text */
 /* LOOOOONG FUNCTION - cannot create helpers because of VLA's */
 /* Dont want to allocate memory each time- will look into it */
-void _add_char_inline(FILE *to, Printer p) {
+static inline void _add_char_inline(FILE *to, Printer p) {
     int8_t *text = p.text;
     size_t tlen = strlen(text);
 
@@ -979,9 +984,9 @@ void _add_char_inline(FILE *to, Printer p) {
 
 /* Helper - combine all printer options */
 static inline void _use_printer(Printer p) {
-    FILE *to = stdout;
+    FILE *to = p.stream ? p.stream : stdout;
 
-    if (strcmp(p.out, "stdout")) to = fopen(p.out, "a");
+    if (!p.stream && strcmp(p.out, "stdout")) to = fopen(p.out, "a");
     if (p.dynamic.cursor) fprintf(to, CURSOR_H);
 
     if (strchr(p.text, '[')) {
@@ -997,7 +1002,7 @@ static inline void _use_printer(Printer p) {
     }
 
     if (p.dynamic.cursor) fprintf(to, CURSOR_S);
-    if (strcmp(p.out, "stdout")) fclose(to);
+    if (!p.stream && strcmp(p.out, "stdout")) fclose(to);
 }
 
 /**
@@ -1015,9 +1020,11 @@ static inline void _use_printer(Printer p) {
  */
 #define println(...) do { \
     Printer _p = _makePrinter((Printer){__VA_ARGS__}); \
-    int8_t _ebuf[strlen(_p.end) + 2]; \
-    strncpy(_ebuf, _p.end, strlen(_p.end)); \
-    strcat(_ebuf, "\n\0"); \
+    size_t _elen = strlen(_p.end); \
+    int8_t _ebuf[_elen + 2]; \
+    memcpy(_ebuf, _p.end, _elen); \
+    _ebuf[_elen] = '\n'; \
+    _ebuf[_elen + 1] = '\0'; \
     _p.end = _ebuf; \
     if (_p.dynamic.raw) { \
         TerminalState _ts = enable_raw(); \
